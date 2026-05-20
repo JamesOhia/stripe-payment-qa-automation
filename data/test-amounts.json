@@ -1,0 +1,27 @@
+{
+  "small": {
+    "amount": 1000,
+    "currency": "usd",
+    "display": "$10.00"
+  },
+  "medium": {
+    "amount": 5000,
+    "currency": "usd",
+    "display": "$50.00"
+  },
+  "large": {
+    "amount": 25000,
+    "currency": "usd",
+    "display": "$250.00"
+  },
+  "eurMedium": {
+    "amount": 5000,
+    "currency": "eur",
+    "display": "€50.00"
+  },
+  "gbpMedium": {
+    "amount": 5000,
+    "currency": "gbp",
+    "display": "£50.00"
+  }
+}

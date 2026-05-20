@@ -1,0 +1,37 @@
+{
+  "name": "stripe-payment-e2e",
+  "version": "1.0.0",
+  "description": "End-to-end automated tests for Stripe Sandbox payment workflow using Playwright (JavaScript)",
+  "type": "module",
+  "scripts": {
+    "save-auth": "node scripts/save-auth.js",
+    "trim-auth": "node scripts/trim-auth.js",
+    "test": "playwright test",
+    "test:api": "playwright test --project=api",
+    "test:ui": "playwright test --project=ui",
+    "test:e2e": "playwright test --project=e2e",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "report": "allure generate ./allure-results --clean -o ./allure-report && allure open ./allure-report",
+    "report:generate": "allure generate ./allure-results --clean -o ./allure-report",
+    "typecheck": "tsc -p jsconfig.json",
+    "clean": "rm -rf allure-results allure-report playwright-report test-results"
+  },
+  "keywords": [
+    "playwright",
+    "stripe",
+    "e2e",
+    "automation",
+    "qa"
+  ],
+  "author": "James Ohia",
+  "license": "MIT",
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^22.10.0",
+    "allure-commandline": "^2.32.0",
+    "allure-playwright": "^3.0.7",
+    "dotenv": "^16.4.7",
+    "typescript": "^5.7.2"
+  }
+}

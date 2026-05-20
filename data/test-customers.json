@@ -1,0 +1,22 @@
+{
+  "default": {
+    "email": "test+default@example.com",
+    "name": "James QA Test",
+    "description": "Default test customer for automation",
+    "address": {
+      "line1": "1 Test Street",
+      "city": "Lagos",
+      "country": "NG",
+      "postal_code": "100001"
+    }
+  },
+  "withMetadata": {
+    "email": "test+meta@example.com",
+    "name": "Metadata Test",
+    "description": "Customer with metadata",
+    "metadata": {
+      "test_run_id": "tr_001",
+      "environment": "sandbox"
+    }
+  }
+}
