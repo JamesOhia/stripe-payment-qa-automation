@@ -1,0 +1,15 @@
+# Environment
+.env
+
+# Auth state
+.auth/
+auth/
+
+# Test output (may contain secrets in attachments/results)
+allure-results/
+allure-report/
+playwright-report/
+test-results/
+
+# Dependencies
+node_modules/
