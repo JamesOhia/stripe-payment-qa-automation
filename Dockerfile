@@ -1,6 +1,6 @@
 # ──────────────────────────────────────────────────────────────────────────────
 #  Stripe Payment QA — Playwright test runner
-#  Base: Node 20 LTS on Debian 12 (Bookworm Slim)
+#  Base: Node 26.2.0 on Debian 12 (Bookworm Slim) — updated by Snyk to patch gnutls28 CVEs
 # ──────────────────────────────────────────────────────────────────────────────
 FROM node:26.2.0-bookworm-slim
 
