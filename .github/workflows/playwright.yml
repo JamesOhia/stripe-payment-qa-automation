@@ -11,6 +11,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  security-events: write   # required to upload SARIF results to GitHub Code Scanning
 
 concurrency:
   group: pages-${{ github.ref }}
@@ -126,7 +127,203 @@ jobs:
           path: allure-report
 
   # ────────────────────────────────────────────────────────────────────────────
-  #  Job 2 — Publish the Allure report to GitHub Pages (main branch only).
+  #  Job 2 — Security scanning (runs in parallel with Job 1).
+  #
+  #  Three scan surfaces:
+  #    A) Snyk: npm dependency CVEs
+  #    B) Snyk: SAST static-analysis of source code
+  #    C) Snyk: Docker container / base-image CVEs
+  #    D) Docker Scout: Docker image CVEs (independent second opinion)
+  #
+  #  Severity filter: critical, high, medium only — no low/informational noise.
+  #
+  #  Outputs:
+  #    • SARIF files  → uploaded to GitHub Code Scanning (Security tab)
+  #    • JSON files   → uploaded as the "security-reports" artifact.
+  #                     Feed these JSON files directly to an AI tool to get
+  #                     prioritised, copy-paste-ready remediation steps.
+  #
+  #  Required secrets:
+  #    SNYK_TOKEN         — from app.snyk.io › Account Settings › Auth Token
+  #    DOCKERHUB_USERNAME — your Docker Hub username
+  #    DOCKERHUB_TOKEN    — Docker Hub personal access token (read-only scope)
+  # ────────────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: Security scanning — Snyk + Docker Scout
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Node.js setup ──────────────────────────────────────────────────────
+      # Snyk needs node_modules present to resolve the dependency graph.
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # ── Snyk CLI install ───────────────────────────────────────────────────
+      - name: Set up Snyk CLI
+        uses: snyk/actions/setup@master
+
+      # ── A. Snyk: npm dependency scan ──────────────────────────────────────
+      # Checks every package in node_modules against Snyk's vulnerability DB.
+      # --json-file-output  → machine-readable JSON for AI remediation
+      # --sarif-file-output → SARIF for GitHub Code Scanning inline annotations
+      # continue-on-error   → exit code 1 means "issues found" — we want the
+      #                        report regardless; don't fail the whole job.
+      - name: Snyk — npm dependency scan (critical / high / medium)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test \
+            --severity-threshold=medium \
+            --json-file-output=snyk-deps.json \
+            --sarif-file-output=snyk-deps.sarif
+
+      # ── B. Snyk: SAST code scan ────────────────────────────────────────────
+      # Static analysis of JavaScript source for security anti-patterns
+      # (e.g. injection, hard-coded secrets, insecure regex).
+      # Note: requires "Snyk Code" to be enabled in your Snyk organisation.
+      - name: Snyk — SAST source-code scan (critical / high / medium)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk code test \
+            --severity-threshold=medium \
+            --sarif-file-output=snyk-code.sarif
+
+      # ── Build the Docker image for container scanning ──────────────────────
+      # Both Snyk container and Docker Scout need the image in the local daemon.
+      # cache-from pulls any already-cached layers from the GHA cache written
+      # by Job 1 (whichever job ran first wins the cache write).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image for security scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: stripe-playwright:scan-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── C. Snyk: Docker container scan ────────────────────────────────────
+      # Scans the image layers AND the Dockerfile instructions for CVEs and
+      # misconfigurations (e.g. running as root, exposed secrets).
+      - name: Snyk — Docker container scan (critical / high / medium)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk container test \
+            stripe-playwright:scan-${{ github.sha }} \
+            --file=Dockerfile \
+            --severity-threshold=medium \
+            --json-file-output=snyk-container.json \
+            --sarif-file-output=snyk-container.sarif
+
+      # ── D. Docker Scout: CVE scan ──────────────────────────────────────────
+      # Docker Scout uses a different vulnerability database (Docker's own +
+      # NVD) giving a second independent opinion on the image.
+      # We run Scout twice: once for SARIF (GitHub Code Scanning) and once for
+      # JSON (AI-friendly artifact) — the two formats cannot be emitted in a
+      # single Scout invocation.
+      - name: Log in to Docker Hub (required by Docker Scout)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker Scout — CVE scan SARIF (critical / high / medium)
+        continue-on-error: true
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: local://stripe-playwright:scan-${{ github.sha }}
+          only-severities: critical,high,medium
+          sarif-file: docker-scout-cves.sarif
+          summary: true
+
+      - name: Docker Scout — CVE scan JSON for AI remediation (critical / high / medium)
+        continue-on-error: true
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: local://stripe-playwright:scan-${{ github.sha }}
+          only-severities: critical,high,medium
+          format: json
+          output: docker-scout-cves.json
+
+      # ── Upload SARIF to GitHub Code Scanning ───────────────────────────────
+      # SARIF results appear in: repo → Security tab → Code scanning alerts.
+      # Each category creates a separate alert group so findings are easy to
+      # distinguish by source tool.
+      # hashFiles() guard prevents the upload action from failing when a scan
+      # step errored before it could write its output file.
+      - name: Upload Snyk dep SARIF → GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('snyk-deps.sarif') != ''
+        with:
+          sarif_file: snyk-deps.sarif
+          category: snyk-dependencies
+
+      - name: Upload Snyk code SARIF → GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk container SARIF → GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('snyk-container.sarif') != ''
+        with:
+          sarif_file: snyk-container.sarif
+          category: snyk-container
+
+      - name: Upload Docker Scout SARIF → GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('docker-scout-cves.sarif') != ''
+        with:
+          sarif_file: docker-scout-cves.sarif
+          category: docker-scout
+
+      # ── Upload all reports as a single downloadable artifact ───────────────
+      # To use with an AI tool for remediation:
+      #   1. Download the "security-reports" artifact from the Actions run page.
+      #   2. Unzip it.
+      #   3. Open your AI tool (e.g. Claude Code) and paste the JSON content
+      #      with the prompt: "Here are my security scan results. Prioritise
+      #      the findings and give me step-by-step remediation for each."
+      #   The JSON format is structured — the AI can map CVE IDs to exact
+      #   package versions and generate the precise npm/apt commands to fix them.
+      - name: Upload security reports artifact (JSON + SARIF for AI remediation)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            snyk-deps.json
+            snyk-deps.sarif
+            snyk-code.sarif
+            snyk-container.json
+            snyk-container.sarif
+            docker-scout-cves.json
+            docker-scout-cves.sarif
+          retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────────────
+  #  Job 3 — Publish the Allure report to GitHub Pages (main branch only).
   # ────────────────────────────────────────────────────────────────────────────
   deploy-pages:
     name: Deploy Allure report to GitHub Pages

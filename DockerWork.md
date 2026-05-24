@@ -340,3 +340,326 @@ docker inspect --format='{{.State.Health.Status}}' <container_id>
 | Pin the `node:20-bookworm-slim` digest | `node:20` tags are mutable (they point to the latest patch). Pinning to a SHA digest (`node:20@sha256:abc...`) makes builds fully reproducible |
 | Multi-stage build | Use a `builder` stage for `npm ci` and a leaner `runtime` stage without build tools. Less relevant here since we need all devDependencies to run tests. |
 | Matrix testing | Run tests in parallel across multiple browser configurations using a GitHub Actions matrix strategy |
+
+---
+
+## 10. DevSecOps — Security scanning with Snyk and Docker Scout
+
+**DevSecOps** means shifting security left: catching vulnerabilities during development and CI, not after deployment. The `security-scan` job in the workflow runs in **parallel** with the `test` job so it adds zero extra time to the pipeline.
+
+---
+
+### 10.1 The threat landscape for this project
+
+This project has four surfaces that can carry vulnerabilities:
+
+| Surface | Risk |
+|---|---|
+| **npm dependencies** | A transitive package (one you don't directly import) could have a known CVE — e.g. a prototype pollution bug in a deeply nested utility |
+| **Source code (SAST)** | Developer mistakes: hard-coded tokens, insecure regex, injection-prone string building |
+| **Docker base image** | `node:20-bookworm-slim` is built on Debian packages. Those packages get CVEs patched over time; a stale image carries unpatched OS vulnerabilities |
+| **Dockerfile instructions** | Misconfigurations: running as root, exposing unnecessary ports, leaking build args as env vars |
+
+Snyk and Docker Scout each cover different parts of this surface, which is why both are used.
+
+---
+
+### 10.2 Snyk — three scan types
+
+Snyk is installed via `snyk/actions/setup@master`, which puts the latest Snyk CLI on the runner PATH.
+
+#### A. Dependency scan (`snyk test`)
+
+```bash
+snyk test \
+  --severity-threshold=medium \
+  --json-file-output=snyk-deps.json \
+  --sarif-file-output=snyk-deps.sarif
+```
+
+**What it checks:** every package in `node_modules`, including deeply nested transitive packages, against Snyk's vulnerability database (fed by NVD, GitHub Advisory, and Snyk's own research).
+
+**Severity threshold explained:**
+- `critical` — CVSS 9.0–10.0. Easily exploitable, often RCE or data exfiltration. Fix immediately.
+- `high` — CVSS 7.0–8.9. Significant risk, commonly exploited in the wild. Fix in current sprint.
+- `medium` — CVSS 4.0–6.9. Requires specific conditions. Fix in next sprint.
+- `low` / `informational` — `--severity-threshold=medium` excludes these. They create noise without actionable risk for a test suite.
+
+**On "confidence":** Snyk dependency findings are binary (the vulnerability either exists in the installed version or it doesn't). There is no ambiguity — the database maps exact package versions to CVE IDs.
+
+**Output files:**
+- `snyk-deps.json` — full machine-readable report. Each vulnerability entry contains: `id`, `title`, `severity`, `packageName`, `version`, `fixedIn`, `isUpgradable`, `isPatchable`, and a `remediation` block with exact upgrade commands.
+- `snyk-deps.sarif` — same findings in SARIF format for GitHub Code Scanning.
+
+#### B. SAST source code scan (`snyk code test`)
+
+```bash
+snyk code test \
+  --severity-threshold=medium \
+  --sarif-file-output=snyk-code.sarif
+```
+
+**What it checks:** JavaScript source files for security anti-patterns using Snyk's ML-based static analysis engine. Common findings:
+- Hard-coded credentials or API keys
+- SQL/command injection paths
+- Prototype pollution
+- Insecure use of `eval()` or `Function()`
+- Path traversal in file operations
+
+**On "confidence" for SAST:** Unlike dependency scans, SAST results can have false positives. Snyk Code's model is trained to minimise these, and `--severity-threshold=medium` already filters out low-confidence informational findings. In the SARIF output each finding has a `level` field (`error` = high/critical, `warning` = medium) which is a proxy for confidence.
+
+**Requirement:** Snyk Code must be enabled for your Snyk organisation (Settings → Snyk Code → Enable). The step uses `continue-on-error: true` so the pipeline doesn't break if the feature is not yet enabled.
+
+#### C. Docker container scan (`snyk container test`)
+
+```bash
+snyk container test \
+  stripe-playwright:scan-${{ github.sha }} \
+  --file=Dockerfile \
+  --severity-threshold=medium \
+  --json-file-output=snyk-container.json \
+  --sarif-file-output=snyk-container.sarif
+```
+
+**What it checks:**
+1. All OS packages installed in the image layers (Debian packages from `node:20-bookworm-slim` plus everything `--with-deps` installed)
+2. The Dockerfile itself for misconfigurations (the `--file=Dockerfile` flag)
+
+**What `--file=Dockerfile` adds:** Snyk analyses the Dockerfile instructions for issues like:
+- `USER root` at the end (running production services as root)
+- `ADD` used where `COPY` is safer
+- Secrets passed via `ARG` or `ENV`
+- Missing `--no-cache` on `apt-get install`
+
+Output structure in `snyk-container.json`:
+```json
+{
+  "vulnerabilities": [
+    {
+      "id": "SNYK-DEBIAN12-LIBSSL3-XXXXX",
+      "title": "...",
+      "severity": "high",
+      "packageName": "libssl3",
+      "version": "3.0.x",
+      "fixedIn": ["3.0.y"],
+      "nearestFixedInVersion": "3.0.y",
+      "dockerfileInstruction": "RUN npx playwright install --with-deps chromium"
+    }
+  ],
+  "docker": {
+    "baseImage": "node:20-bookworm-slim",
+    "baseImageRemediation": {
+      "advice": [
+        { "message": "Base Image  node:20-alpine\nVulnerabilities  0C 0H 0M" }
+      ]
+    }
+  }
+}
+```
+The `baseImageRemediation` section is particularly valuable — it tells you which alternative base image would eliminate the most vulnerabilities.
+
+---
+
+### 10.3 Docker Scout — independent CVE second opinion
+
+Docker Scout is Docker's native image vulnerability scanner. It uses a different vulnerability database (Docker's own CVE feed + NVD) which means it can surface findings Snyk misses, and vice versa. Having both provides defence-in-depth for the image scanning layer.
+
+```yaml
+- uses: docker/scout-action@v1
+  with:
+    command: cves
+    image: local://stripe-playwright:scan-${{ github.sha }}
+    only-severities: critical,high,medium
+    sarif-file: docker-scout-cves.sarif
+    summary: true
+```
+
+**`local://` prefix:** tells Scout the image is already in the local Docker daemon (built in the previous step). Without this prefix, Scout tries to pull the image from Docker Hub.
+
+**`only-severities: critical,high,medium`:** maps directly to CVSS score bands. Scout shows a table in the workflow log summary so you can see the count at a glance without downloading any files.
+
+**Why two Scout steps (SARIF then JSON)?** Docker Scout cannot output SARIF and JSON simultaneously in a single action invocation. The `sarif-file` parameter implies SARIF format; the `format: json` parameter writes JSON to `output`. Running the action twice on the same cached image is fast.
+
+**Docker Scout JSON structure** (`docker-scout-cves.json`):
+```json
+{
+  "vulnerabilities": [
+    {
+      "cve_id": "CVE-2024-XXXXX",
+      "severity": "high",
+      "package": { "name": "libssl3", "version": "3.0.x" },
+      "fix": { "versions": ["3.0.y"] },
+      "description": "...",
+      "cvss_score": 8.1
+    }
+  ]
+}
+```
+
+---
+
+### 10.4 How SARIF flows to GitHub Code Scanning
+
+SARIF (Static Analysis Results Interchange Format) is a JSON schema standardised by OASIS. GitHub natively understands SARIF and shows the results in three places:
+
+1. **Security tab → Code scanning alerts** — every finding gets its own alert with file+line annotation, severity badge, and a link to the CWE.
+2. **Pull Request "Checks" tab** — new findings introduced by a PR are flagged inline in the diff view, so reviewers see them without leaving the PR.
+3. **Security Overview** — organization-level view of all repos' alert counts.
+
+The `category` field on `upload-sarif` groups alerts by tool:
+```yaml
+category: snyk-dependencies   # npm CVEs
+category: snyk-code            # SAST findings
+category: snyk-container       # image/OS CVEs
+category: docker-scout         # Scout CVEs (second opinion)
+```
+
+`hashFiles('file.sarif') != ''` in the `if:` condition prevents the upload step from failing when a scan step errored before writing its output file.
+
+---
+
+### 10.5 How to use the JSON reports with an AI tool for remediation
+
+When the `security-scan` job finishes:
+
+1. Go to the GitHub Actions run page.
+2. Scroll to "Artifacts" at the bottom → download **security-reports.zip**.
+3. Unzip it. You'll find:
+   - `snyk-deps.json` — npm dependency CVEs
+   - `snyk-container.json` — Docker image OS CVEs
+   - `docker-scout-cves.json` — Docker Scout CVEs
+   - `snyk-code.sarif`, `snyk-deps.sarif`, `snyk-container.sarif`, `docker-scout-cves.sarif` — GitHub Code Scanning uploads
+
+4. Open Claude Code (or any AI tool) and paste the JSON content with a prompt like:
+
+```
+Here are my Snyk dependency scan results (snyk-deps.json):
+
+<paste JSON here>
+
+Please:
+1. List findings by severity (critical first).
+2. For each finding, give me the exact npm command to fix it.
+3. Flag any that have no fix available.
+```
+
+**Why JSON beats HTML for AI consumption:**
+- HTML is for human reading — it contains layout, icons, and navigation.
+- JSON is structured data — the AI can map `packageName` + `version` → `fixedIn` without parsing HTML.
+- The AI can generate `npm update <package>@<fixedVersion>` commands, Dockerfile `FROM` changes, or `package.json` pinning — directly from the structured fields.
+
+---
+
+### 10.6 New secrets required
+
+Add these in: GitHub repo → Settings → Secrets and variables → Actions → New repository secret.
+
+| Secret name | How to get it |
+|---|---|
+| `SNYK_TOKEN` | Log into [app.snyk.io](https://app.snyk.io) → Account Settings → Auth Token |
+| `DOCKERHUB_USERNAME` | Your Docker Hub username (not email) |
+| `DOCKERHUB_TOKEN` | Docker Hub → Account Settings → Personal Access Tokens → Create token with **Read-only** scope |
+
+> **Security note:** use a Read-only Docker Hub token — the `security-scan` job only needs to pull Scout's CVE database, never push. Least-privilege principle.
+
+---
+
+### 10.7 Updated pipeline flow with security scanning
+
+```
+Developer pushes code
+        │
+        ├──────────────────────────────────────────┐
+        ▼                                          ▼
+┌───────────────────────┐              ┌───────────────────────────────────────────────┐
+│  Job: test            │              │  Job: security-scan (runs in parallel)        │
+│                       │              │                                               │
+│  1. docker build      │              │  1. npm ci  (Snyk dep scan needs node_modules)│
+│  2. docker run tests  │              │  2. snyk test → snyk-deps.json + .sarif       │
+│  3. allure generate   │              │  3. snyk code test → snyk-code.sarif          │
+│  4. upload artifacts  │              │  4. docker build (cached layers)              │
+│                       │              │  5. snyk container test → .json + .sarif      │
+└───────────────────────┘              │  6. docker login (Docker Hub)                 │
+        │                              │  7. docker scout → .sarif (GitHub Scanning)   │
+        │ (main only)                  │  8. docker scout → .json  (AI artifact)       │
+        ▼                              │  9. upload SARIF → GitHub Code Scanning       │
+┌───────────────────────┐              │ 10. upload artifact: security-reports.zip     │
+│  Job: deploy-pages    │              └───────────────────────────────────────────────┘
+│  GitHub Pages         │
+└───────────────────────┘
+```
+
+---
+
+### 10.8 Additional security scanning tools recommended
+
+The Snyk + Docker Scout combination covers dependencies and images well, but two important surfaces are still uncovered:
+
+#### 1. Secret / credential leak detection — Gitleaks (STRONGLY RECOMMENDED for this project)
+
+**Why critical here:** this project handles Stripe API keys, dashboard credentials, and webhook secrets. A developer accidentally committing a `.env` file or an API key in a test fixture is a real risk.
+
+**What it does:** scans the entire git history and current files for patterns that look like secrets (API keys, private keys, tokens, connection strings). It uses a library of 150+ secret patterns.
+
+**How to add it:**
+```yaml
+- name: Gitleaks — secret detection
+  uses: gitleaks/gitleaks-action@v2
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # free for public repos
+```
+
+Gitleaks will fail the job (exit code 1) if it finds a committed secret — which is the correct behaviour. You want the build to break rather than let a leaked key reach `main`.
+
+#### 2. npm audit (built-in, zero config, no token needed)
+
+```yaml
+- name: npm audit (critical and high only)
+  run: npm audit --audit-level=high
+  continue-on-error: true
+```
+
+`npm audit` uses the npm Advisory Database (slightly different from Snyk's). It requires no tokens, no accounts. Running both Snyk and npm audit gives the widest CVE coverage. Use `--audit-level=high` to only exit non-zero for high/critical findings.
+
+#### 3. Trivy (optional alternative / complement to Docker Scout)
+
+Trivy by Aqua Security is a free, no-login-required image scanner with excellent CVE coverage. It can scan images, filesystems, git repos, and IaC. If Docker Hub login is unavailable (e.g. organisation policy), Trivy is the drop-in replacement for Docker Scout:
+
+```yaml
+- name: Trivy — container vulnerability scan
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: stripe-playwright:scan-${{ github.sha }}
+    format: sarif
+    output: trivy-results.sarif
+    severity: CRITICAL,HIGH,MEDIUM
+    exit-code: 0   # informational; don't fail the job
+```
+
+#### Summary of recommended stack
+
+| Tool | Surface | Token required? | When to add |
+|---|---|---|---|
+| **Snyk** (already added) | npm deps, SAST, container | Yes (free tier) | Done |
+| **Docker Scout** (already added) | Container image CVEs | Docker Hub PAT | Done |
+| **Gitleaks** | Committed secrets/keys | Free for public repos | Add now — high value for Stripe keys |
+| **npm audit** | npm deps (second DB) | No | Add now — zero friction |
+| **Trivy** | Container image CVEs | No | Add if Docker Hub auth is unavailable |
+
+---
+
+### 10.9 DevSecOps concepts glossary
+
+| Term | What it means |
+|---|---|
+| **CVE** | Common Vulnerabilities and Exposures — a unique ID (e.g. CVE-2024-12345) assigned to a specific vulnerability |
+| **CVSS** | Common Vulnerability Scoring System — a 0–10 number rating how severe a CVE is |
+| **SAST** | Static Application Security Testing — analysing source code without running it |
+| **DAST** | Dynamic Application Security Testing — analysing a running app (not implemented here) |
+| **SARIF** | Static Analysis Results Interchange Format — a JSON schema that GitHub uses to render inline code annotations in PRs and the Security tab |
+| **Shift left** | Moving security checks earlier in the development lifecycle (into CI/PR, not just pre-release audits) |
+| **Least privilege** | Every token/credential should have the minimum permissions it needs — hence the Read-only Docker Hub PAT |
+| **Defence in depth** | Using multiple tools with overlapping coverage (Snyk + Docker Scout) so no single tool's blind spot becomes a gap |
+| **False positive** | A reported vulnerability that is not actually exploitable in your context |
+| **Transitive dependency** | A package you didn't directly install, but one of your dependencies installed — most CVEs come from here |
